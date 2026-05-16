@@ -240,34 +240,106 @@ async function handleJsonDownload(reqUrl, res, method = 'GET') {
   res.end(raw);
 }
 
+// ── PNG + card-data embedding (Chara Card V2 spec) ───────────────────────────
+
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let j = 0; j < 8; j++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+    t[i] = c;
+  }
+  return t;
+})();
+
+function crc32(buf) {
+  let crc = 0xFFFFFFFF;
+  for (const b of buf) crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ b) & 0xFF];
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+function makeTEXtChunk(keyword, text) {
+  const data = Buffer.concat([Buffer.from(keyword + '\0'), Buffer.from(text, 'latin1')]);
+  const type = Buffer.from('tEXt');
+  const len  = Buffer.allocUnsafe(4); len.writeUInt32BE(data.length);
+  const crc  = Buffer.allocUnsafe(4); crc.writeUInt32BE(crc32(Buffer.concat([type, data])));
+  return Buffer.concat([len, type, data, crc]);
+}
+
+function injectCardIntoPng(pngBuf, cardJson) {
+  const PNG_SIG = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  if (!pngBuf.subarray(0, 8).equals(PNG_SIG)) throw new Error('Not a valid PNG');
+
+  // IHDR is always 25 bytes (4 len + 4 type + 13 data + 4 crc) after the 8-byte signature
+  const AFTER_IHDR = 33;
+
+  // strip any existing 'chara' tEXt chunks from the remainder
+  const tail     = pngBuf.subarray(AFTER_IHDR);
+  const filtered = [];
+  let i = 0;
+  while (i + 12 <= tail.length) {
+    const chunkLen  = tail.readUInt32BE(i);
+    const chunkType = tail.subarray(i + 4, i + 8).toString('ascii');
+    const total     = 4 + 4 + chunkLen + 4;
+    if (chunkType === 'tEXt') {
+      const d = tail.subarray(i + 8, i + 8 + chunkLen);
+      const kw = d.subarray(0, d.indexOf(0)).toString();
+      if (kw === 'chara') { i += total; continue; }
+    }
+    filtered.push(tail.subarray(i, i + total));
+    i += total;
+  }
+
+  const b64chunk = makeTEXtChunk('chara', Buffer.from(JSON.stringify(cardJson)).toString('base64'));
+
+  return Buffer.concat([pngBuf.subarray(0, AFTER_IHDR), b64chunk, ...filtered]);
+}
+
 async function handlePngDownload(reqUrl, res, method = 'GET') {
   const card = await readSafeCard(reqUrl.searchParams.get('path'));
   if (card.error) return text(res, card.code, card.error);
-  const imageUrl = card.record.avatar;
-  if (!imageUrl) return text(res, 404, 'No avatar URL found');
+  const fullPath = card.record.fullPath;
+  if (!fullPath) return text(res, 404, 'No avatar path found');
 
-  let upstream;
+  // get raw PNG bytes — local disk first, charhub fallback
+  let pngBuf;
+  const localFile = path.join(AVATARS_DIR, fullPath, 'chara_card_v2.png');
   try {
-    upstream = await fetch(imageUrl, { redirect: 'follow' });
-  } catch (error) {
-    return text(res, 502, `Avatar fetch failed: ${error.message || String(error)}`);
+    pngBuf = await fsp.readFile(localFile);
+  } catch {
+    const remoteUrl = `https://avatars.charhub.io/avatars/${encodeURI(fullPath)}/chara_card_v2.png`;
+    let lastError;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const upstream = await fetch(remoteUrl, { redirect: 'follow', signal: AbortSignal.timeout(30_000) });
+        if (!upstream.ok) return text(res, upstream.status, `Avatar fetch failed: ${upstream.status}`);
+        pngBuf = Buffer.from(await upstream.arrayBuffer());
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+        if (attempt < 2) await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+      }
+    }
+    if (lastError) return text(res, 502, `Avatar fetch failed: ${lastError.message || String(lastError)}`);
   }
-  if (!upstream.ok) return text(res, upstream.status, `Avatar fetch failed: ${upstream.status}`);
 
-  const filename = `${safeFileName(card.record.name, card.record.fullPath)}.png`;
+  // embed card JSON into PNG tEXt chunk so SillyTavern can import it directly
+  let outBuf;
+  try {
+    outBuf = injectCardIntoPng(pngBuf, card.parsed);
+  } catch {
+    outBuf = pngBuf;
+  }
+
+  const filename = `${safeFileName(card.record.name, fullPath)}.png`;
   res.writeHead(200, {
-    'content-type': upstream.headers.get('content-type') || 'image/png',
+    'content-type': 'image/png',
     'content-disposition': `attachment; filename="${filename}"`,
-    'cache-control': 'no-store',
+    'content-length': outBuf.length,
   });
   if (method === 'HEAD') return res.end();
-  try {
-    for await (const chunk of upstream.body) res.write(chunk);
-    res.end();
-  } catch (error) {
-    if (!res.headersSent) return text(res, 502, `Avatar stream failed: ${error.message || String(error)}`);
-    res.destroy(error);
-  }
+  res.end(outBuf);
 }
 
 async function handleImg(reqUrl, res, method) {
