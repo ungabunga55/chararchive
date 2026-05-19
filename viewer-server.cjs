@@ -13,10 +13,18 @@ const PORT = Number(process.env.PORT || 8787);
 const CACHE_DIR = path.join(ROOT, '.chub-viewer-cache');
 const INDEX_PATH = path.join(CACHE_DIR, 'cards.jsonl');
 const INDEX_TMP_PATH = path.join(CACHE_DIR, 'cards.jsonl.tmp');
+const META_PATH = path.join(CACHE_DIR, 'meta.jsonl');
 const HTML_PATH = path.join(ROOT, 'viewer.html');
 const AVATARS_DIR = path.join(ROOT, 'avatars');
 
-const cards = [];
+const AVATAR_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9',
+};
+
+const cards   = [];
+const metaMap = new Map(); // fullPath -> meta record
 const status = {
   mode: 'starting',
   ready: false,
@@ -29,8 +37,43 @@ const status = {
   finishedAt: null,
 };
 
-function json(res, code, value) {
-  const body = JSON.stringify(value);
+// ── meta loading + enrichment ─────────────────────────────────────────────────
+
+async function loadMeta() {
+  if (!fs.existsSync(META_PATH)) return;
+  const input = fs.createReadStream(META_PATH, 'utf8');
+  const lines = readline.createInterface({ input, crlfDelay: Infinity });
+  for await (const line of lines) {
+    if (!line) continue;
+    try {
+      const m = JSON.parse(line);
+      if (m.fullPath && !m.error) metaMap.set(m.fullPath, m);
+    } catch {}
+  }
+  console.log(`Loaded ${metaMap.size.toLocaleString()} meta records`);
+}
+
+function enrichWithMeta(card) {
+  const m = metaMap.get(card.fullPath);
+  if (!m) return;
+  card.tagline       = m.tagline       || '';
+  card.starCount     = m.starCount     || 0;
+  card.nFavorites    = m.nFavorites    || 0;
+  card.nChats        = m.nChats        || 0;
+  card.nMessages     = m.nMessages     || 0;
+  card.rating        = m.rating        || 0;
+  card.ratingCount   = m.ratingCount   || 0;
+  card.ratingScore   = m.ratingScore   || 0;
+  card.forksCount    = m.forksCount    || 0;
+  card.nTokens       = m.nTokens       || 0;
+  card.lastActivityAt = m.lastActivityAt || null;
+  card.createdAt     = m.createdAt     || null;
+  card.isUnlisted    = m.isUnlisted    || false;
+  card.isPublic      = m.isPublic      !== false;
+  card.primaryFormat = m.primaryFormat || '';
+}
+
+function json(res, code, value) {  const body = JSON.stringify(value);
   res.writeHead(code, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(body),
@@ -72,7 +115,8 @@ function getChub(data) {
 function getImageUrl(data) {
   const fullPath = getChub(data).full_path;
   if (typeof fullPath === 'string' && fullPath) {
-    // /img/ serves local file if downloaded, falls back to charhub automatically
+    // Always route through /img/ — serves local PNG if downloaded,
+    // otherwise redirects to the lightweight charhub webp
     return `/img/${encodeURI(fullPath)}/chara_card_v2.png`;
   }
   return '';
@@ -107,7 +151,9 @@ async function loadExistingIndex() {
   for await (const line of lines) {
     if (!line) continue;
     try {
-      cards.push(JSON.parse(line));
+      const card = JSON.parse(line);
+      enrichWithMeta(card);
+      cards.push(card);
       status.kept = cards.length;
     } catch {
       status.errors += 1;
@@ -153,14 +199,39 @@ async function buildIndex() {
   status.indexing = true;
   status.message = 'Building metadata index in the background';
   await fsp.mkdir(CACHE_DIR, { recursive: true });
-  const out = fs.createWriteStream(INDEX_TMP_PATH, 'utf8');
+
+  // Resume from a previous interrupted run if .tmp already exists
+  const doneJsonPaths = new Set();
+  if (fs.existsSync(INDEX_TMP_PATH)) {
+    const input = fs.createReadStream(INDEX_TMP_PATH, 'utf8');
+    const lines = readline.createInterface({ input, crlfDelay: Infinity });
+    for await (const line of lines) {
+      if (!line) continue;
+      try {
+        const card = JSON.parse(line);
+        enrichWithMeta(card);
+        cards.push(card);
+        doneJsonPaths.add(card.jsonPath);
+        status.kept = cards.length;
+      } catch {}
+    }
+    if (doneJsonPaths.size > 0) {
+      status.message = `Resuming index (${doneJsonPaths.size.toLocaleString()} already done)`;
+    }
+  }
+
+  // Append to .tmp so a second interruption doesn't lose the first batch either
+  const out = fs.createWriteStream(INDEX_TMP_PATH, { flags: 'a', encoding: 'utf8' });
 
   try {
     for await (const filePath of iterJsonFiles()) {
+      const rel = relPath(filePath);
+      if (doneJsonPaths.has(rel)) { status.scanned += 1; continue; } // already done
       status.scanned += 1;
       try {
         const result = await parseCardFile(filePath);
         if (!result) continue;
+        enrichWithMeta(result.record);
         cards.push(result.record);
         status.kept = cards.length;
         out.write(`${JSON.stringify(result.record)}\n`);
@@ -180,19 +251,42 @@ async function buildIndex() {
 }
 
 function queryCards(params) {
-  const q = (params.get('q') || '').trim().toLowerCase();
+  const q      = (params.get('q')      || '').trim().toLowerCase();
   const offset = Math.max(0, Number(params.get('offset') || 0));
-  const limit = Math.min(80, Math.max(1, Number(params.get('limit') || 40)));
-  const terms = q.split(/\s+/).filter(Boolean);
+  const limit  = Math.min(80, Math.max(1, Number(params.get('limit') || 40)));
+  const sort   = params.get('sort')   || 'default';
+  const filter = params.get('filter') || 'all';
+  const terms  = q.split(/\s+/).filter(Boolean);
 
   let filtered = cards;
+
+  // text search
   if (terms.length) {
     filtered = cards.filter((card) => {
       const textValue = [card.name, card.creator, ...(card.tags || [])]
-        .join(' ')
-        .toLowerCase();
+        .join(' ').toLowerCase();
       return terms.every((term) => textValue.includes(term));
     });
+  }
+
+  // listed/unlisted filter
+  if (filter === 'public')   filtered = filtered.filter(c => c.isPublic && !c.isUnlisted);
+  if (filter === 'unlisted') filtered = filtered.filter(c => c.isUnlisted);
+
+  // sort (copy first so we never mutate the source array)
+  if (sort !== 'default') {
+    filtered = [...filtered];
+    switch (sort) {
+      case 'stars':     filtered.sort((a, b) => (b.starCount    || 0) - (a.starCount    || 0)); break;
+      case 'favorites': filtered.sort((a, b) => (b.nFavorites   || 0) - (a.nFavorites   || 0)); break;
+      case 'chats':    filtered.sort((a, b) => (b.nChats       || 0) - (a.nChats       || 0)); break;
+      case 'messages': filtered.sort((a, b) => (b.nMessages    || 0) - (a.nMessages    || 0)); break;
+      case 'rating':   filtered.sort((a, b) => (b.ratingScore  || 0) - (a.ratingScore  || 0)); break;
+      case 'forks':    filtered.sort((a, b) => (b.forksCount   || 0) - (a.forksCount   || 0)); break;
+      case 'activity': filtered.sort((a, b) => (b.lastActivityAt || '').localeCompare(a.lastActivityAt || '')); break;
+      case 'newest':   filtered.sort((a, b) => (b.createdAt    || '').localeCompare(a.createdAt    || '')); break;
+      case 'oldest':   filtered.sort((a, b) => (a.createdAt    || '').localeCompare(b.createdAt    || '')); break;
+    }
   }
 
   return {
@@ -208,6 +302,7 @@ function publicStatus() {
   return {
     ...status,
     cards: cards.length,
+    metaCount: metaMap.size,
     uptimeSeconds: Math.round((Date.now() - status.startedAt) / 1000),
   };
 }
@@ -311,7 +406,7 @@ async function handlePngDownload(reqUrl, res, method = 'GET') {
     let lastError;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        const upstream = await fetch(remoteUrl, { redirect: 'follow', signal: AbortSignal.timeout(30_000) });
+        const upstream = await fetch(remoteUrl, { redirect: 'follow', signal: AbortSignal.timeout(30_000), headers: AVATAR_HEADERS });
         if (!upstream.ok) return text(res, upstream.status, `Avatar fetch failed: ${upstream.status}`);
         pngBuf = Buffer.from(await upstream.arrayBuffer());
         lastError = null;
@@ -347,10 +442,10 @@ async function handleImg(reqUrl, res, method) {
   const rel = decodeURIComponent(reqUrl.pathname.slice(5));
   if (!rel || rel.includes('\0') || rel.includes('..')) return text(res, 400, 'Bad path');
 
-  // try local file first
   const localPath = path.join(AVATARS_DIR, rel);
   if (!localPath.startsWith(AVATARS_DIR + path.sep)) return text(res, 400, 'Bad path');
 
+  // serve local PNG if already downloaded
   try {
     const stat = await fsp.stat(localPath);
     res.writeHead(200, {
@@ -361,32 +456,15 @@ async function handleImg(reqUrl, res, method) {
     if (method === 'HEAD') return res.end();
     fs.createReadStream(localPath).pipe(res);
     return;
-  } catch {
-    // not downloaded yet — proxy from charhub
-  }
+  } catch { /* not on disk yet */ }
 
-  const remoteUrl = `https://avatars.charhub.io/avatars/${encodeURI(rel)}`;
-  let upstream;
-  try {
-    upstream = await fetch(remoteUrl, { redirect: 'follow' });
-  } catch (error) {
-    return text(res, 502, `Fetch failed: ${error.message}`);
-  }
-  if (!upstream.ok) return text(res, upstream.status, `Remote ${upstream.status}`);
-
-  res.writeHead(200, {
-    'content-type': upstream.headers.get('content-type') || 'image/png',
-    'cache-control': 'public, max-age=3600',
-  });
-  if (method === 'HEAD') return res.end();
-  try {
-    for await (const chunk of upstream.body) res.write(chunk);
-    res.end();
-  } catch (error) {
-    res.destroy(error);
-  }
+  // not downloaded — redirect to the lightweight charhub webp instead of proxying the full PNG
+  // strip the filename to get the base path, then point at avatar.webp
+  const basePath = rel.replace(/\/[^/]+$/, '');
+  const webpUrl  = `https://avatars.charhub.io/avatars/${encodeURI(basePath)}/avatar.webp`;
+  res.writeHead(302, { 'location': webpUrl, 'cache-control': 'public, max-age=3600' });
+  res.end();
 }
-
 async function handler(req, res) {
   const reqUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   try {
@@ -415,6 +493,8 @@ async function main() {
     console.log(`Chub viewer: http://127.0.0.1:${PORT}`);
     console.log('Images are fetched on demand; no PNG mirror is created.');
   });
+
+  await loadMeta(); // fast — loads from file if present, before cards
 
   if (fs.existsSync(INDEX_PATH)) {
     await loadExistingIndex();
