@@ -33,7 +33,7 @@
       backdrop-filter: blur(12px);
     }
     h1 { margin: 0 0 .65rem; font-size: clamp(1.25rem, 4vw, 2rem); }
-    .controls { display: grid; grid-template-columns: minmax(0,1fr) auto auto; gap: .65rem; }
+    .controls { display: grid; grid-template-columns: minmax(0,1fr) auto auto auto auto; gap: .65rem; }
     input, select, button, a.button {
       border: 1px solid var(--line); border-radius: .75rem;
       background: var(--panel-2); color: var(--text);
@@ -60,6 +60,7 @@
     .meta { color: var(--muted); font-size: .88rem; overflow-wrap: anywhere; margin-top: .2rem; }
     .tags { display: flex; flex-wrap: wrap; gap: .25rem; margin-top: .55rem; }
     .tag { color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: .1rem .4rem; font-size: .75rem; }
+    .tagline { color: var(--muted); font-size: .82rem; font-style: italic; margin-top: .15rem; overflow-wrap: anywhere; line-height: 1.3; }
     .actions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: .45rem; margin-top: .75rem; }
     .actions .wide { grid-column: 1 / -1; }
     .actions button, .actions a { text-align: center; font-size: .82rem; padding: .5rem .3rem; }
@@ -164,12 +165,9 @@
     .cd-raw { white-space: pre-wrap; word-break: break-word; color: #d6deff; font: 13px/1.5 monospace; }
 
     @media (max-width: 680px) {
-      .controls { grid-template-columns: 1fr; }
+      .controls { grid-template-columns: 1fr 1fr; }
+      .controls input { grid-column: 1 / -1; }
       main, header { padding: .75rem; }
-      .cd-layout { grid-template-columns: 1fr; }
-      .cd-side { flex-direction: row; border-right: none; border-bottom: 1px solid var(--line); }
-      .cd-avatar { width: 120px; aspect-ratio: 2/3; flex-shrink: 0; }
-      .cd-dl { flex-direction: row; flex-wrap: wrap; align-items: flex-start; }
     }
   </style>
 </head>
@@ -178,6 +176,23 @@
     <h1>Chub Card Viewer</h1>
     <div class="controls">
       <input id="search" type="search" placeholder="Search by name, creator, or tag" autocomplete="off">
+      <select id="sort" aria-label="Sort by">
+        <option value="default">Default order</option>
+        <option value="stars">Most starred</option>
+        <option value="favorites">Most favorited</option>
+        <option value="chats">Most chats</option>
+        <option value="messages">Most messages</option>
+        <option value="rating">Best rated</option>
+        <option value="forks">Most forked</option>
+        <option value="activity">Latest activity</option>
+        <option value="newest">Newest</option>
+        <option value="oldest">Oldest</option>
+      </select>
+      <select id="filterList" aria-label="Filter">
+        <option value="all">All cards</option>
+        <option value="public">Public only</option>
+        <option value="unlisted">Unlisted only</option>
+      </select>
       <select id="limit" aria-label="Cards per page">
         <option value="24">24</option>
         <option value="40" selected>40</option>
@@ -224,6 +239,8 @@
     const empty     = document.querySelector('#empty');
     const statusEl  = document.querySelector('#status');
     const search    = document.querySelector('#search');
+    const sortEl    = document.querySelector('#sort');
+    const filterEl  = document.querySelector('#filterList');
     const limit     = document.querySelector('#limit');
     const more      = document.querySelector('#more');
     const cardDialog = document.querySelector('#cardDialog');
@@ -245,10 +262,11 @@
     function renderStatus(status) {
       const values = [
         status.message,
-        `${Number(status.cards || 0).toLocaleString()} cards loaded`,
+        `${Number(status.cards || 0).toLocaleString()} cards`,
+        status.metaCount ? `${Number(status.metaCount).toLocaleString()} with metadata` : null,
         `${Number(status.scanned || 0).toLocaleString()} scanned`,
         `${Number(status.errors || 0).toLocaleString()} errors`,
-      ];
+      ].filter(Boolean);
       statusEl.innerHTML = values.map((v) => `<span class="pill">${esc(v)}</span>`).join('');
     }
 
@@ -262,6 +280,7 @@
         <img class="thumb" loading="lazy" referrerpolicy="no-referrer" alt="" src="${esc(card.avatar || '')}">
         <div class="body">
           <div class="name">${esc(card.name)}</div>
+          ${card.tagline ? `<div class="tagline">${esc(card.tagline)}</div>` : ''}
           <div class="meta">${esc(card.creator || card.fullPath || card.jsonPath)}</div>
           <div class="tags">${tags}</div>
           <div class="actions">
@@ -397,7 +416,7 @@
     /* ── pagination ── */
     async function loadCards(reset = false) {
       if (reset) { offset = 0; grid.innerHTML = ''; }
-      const data = await fetch(apiUrl('/api/cards', { q: search.value, offset, limit: limit.value })).then((r) => r.json());
+      const data = await fetch(apiUrl('/api/cards', { q: search.value, offset, limit: limit.value, sort: sortEl.value, filter: filterEl.value })).then((r) => r.json());
       renderStatus(data.status);
       total = data.total;
       for (const card of data.items) grid.append(renderCard(card));
@@ -425,6 +444,8 @@
 
     document.querySelector('#refresh').addEventListener('click', () => loadCards(true));
     search.addEventListener('input', queueSearch);
+    sortEl.addEventListener('change', () => loadCards(true));
+    filterEl.addEventListener('change', () => loadCards(true));
     limit.addEventListener('change', () => loadCards(true));
     more.addEventListener('click', () => loadCards(false));
 
