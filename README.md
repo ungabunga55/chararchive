@@ -1,6 +1,8 @@
 # Chub Card Viewer
 
-A local gallery viewer for the Chub.ai character card dump. Browse, search, sort, open, and download cards from your machine. The JSON dump stays local. Thumbnails lazy-load from `avatars.charhub.io` unless you mirror PNGs locally.
+A local gallery viewer for the Chub.ai character card dump. Browse, search, sort, open, and download cards from your machine. The JSON dump stays local.
+
+The viewer can browse card data with only the JSON dump. For gallery images, the current setup is local-first: it uses generated local WebP thumbnails when available, then local full PNGs, then remote CharHub `avatar.webp` as the final fallback. PNG card downloads can also fetch the full PNG from CharHub if the local PNG is missing, while that endpoint remains available.
 
 ## Data Sources
 
@@ -33,6 +35,7 @@ chub/
   viewer-server.cjs
   viewer.html
   download-pngs.cjs
+  generate-thumbnails.cjs
   fetch-metadata.cjs
   README.md
 ```
@@ -53,25 +56,37 @@ Node.js 18 or newer:
 node --version
 ```
 
-Optional PNG compression:
+Optional PNG compression and thumbnail generation:
 
 ```bash
-sudo apt install pngquant
+sudo apt install pngquant webp
 ```
 
-`pngquant` is only needed if you run `download-pngs.cjs` and want compressed local PNGs.
+`pngquant` is only needed if you run `download-pngs.cjs` and want compressed local PNGs. `webp` provides `cwebp`, which is needed for `generate-thumbnails.cjs`.
 
 ## Storage
 
-| Item | Approx size |
-|---|---:|
-| JSON dump only | 15-20 GB |
-| Viewer card index `.chub-viewer-cache/cards.jsonl` | 100-150 MB |
-| Extra API metadata `.chub-viewer-cache/meta.jsonl` | varies, potentially 100+ MB |
-| PNGs without compression | around 300 GB |
-| PNGs with `pngquant --quality=70-80` | roughly 65-100 GB projected from sample testing |
+Measured on this machine right now:
 
-The JSON dump is large because many cards embed full lorebooks and long definitions inline. The viewer index is small because it stores only minimal searchable metadata like path, name, creator, full path, avatar path, and tags.
+| Item | Actual size |
+|---|---:|
+| JSON shard folders `00/`-`65/` | 16 GB |
+| Name index `w401i2.txt` | 21 MB |
+| Full cache folder `.chub-viewer-cache/` | 541 MB |
+| Card index `.chub-viewer-cache/cards.jsonl` | 333 MB |
+| Extra API metadata `.chub-viewer-cache/meta.jsonl` | 208 MB |
+| Local WebP thumbnails in `thumbs/` | 8.9 GB |
+| Local full PNG archive in `avatars/` | 162 GB |
+
+General expectations:
+
+| Item | Typical/expected size |
+|---|---:|
+| PNGs if not mirrored locally | 0 GB locally; gallery falls back to remote CharHub `avatar.webp` |
+| PNGs mirrored locally without compression | around 200 GB |
+| PNGs mirrored locally with `pngquant --quality=70-80` | depends heavily on already-existing/uncompressed files; current measured archive is 162 GB |
+
+The JSON dump is large because many cards embed full lorebooks and long definitions inline. The card index stores the card list, local JSON paths, avatar paths, tags, and any metadata that was available when the index was built. If metadata exists, `cards.jsonl` can be much larger than a minimal index.
 
 ## Run The Viewer
 
@@ -114,20 +129,88 @@ Delete `.chub-viewer-cache/cards.jsonl` and `.chub-viewer-cache/cards.jsonl.tmp`
 
 ## Gallery Images
 
+The gallery image pipeline is local-first with CharHub as the final fallback. This means the viewer is fast when local thumbnails exist, still works if only local PNGs exist, and can still show remote thumbnails if nothing has been mirrored yet.
+
 The gallery avatar URL always goes through the local viewer:
+
+```text
+/thumb/{creator}/{character}/avatar.webp
+```
+
+The `/thumb/` route behaves like this:
+
+| Local file exists? | Gallery behavior |
+|---|---|
+| `thumbs/.../avatar.webp` exists | Serve local thumbnail |
+| Thumbnail missing, `avatars/.../chara_card_v2.png` exists | Serve local full PNG as fallback |
+| Both missing | Redirect to remote CharHub `avatar.webp` as last fallback |
+
+This makes phone/remote browsing much faster once thumbnails exist, because gallery cards load small local WebP files instead of full PNGs.
+
+Remote final fallback endpoint:
+
+```text
+https://avatars.charhub.io/avatars/{creator}/{character}/avatar.webp
+```
+
+The full PNG route still exists for local PNG serving:
 
 ```text
 /img/{creator}/{character}/chara_card_v2.png
 ```
 
-The `/img/` route behaves like this:
+`/img/` is kept for local full PNG access and legacy cached cards. It serves local PNGs when present and redirects to CharHub `avatar.webp` if the local PNG is missing.
 
-| Local PNG exists? | Gallery behavior |
-|---|---|
-| Yes | Serve local `avatars/.../chara_card_v2.png` |
-| No | Redirect to lightweight charhub `avatar.webp` |
+If your `.chub-viewer-cache/cards.jsonl` was created before the thumbnail route existed, rebuild it so card avatar URLs point to `/thumb/`:
 
-This means the viewer works immediately without downloading the 200 GB archive. If you later run the PNG downloader, cards automatically start using local PNGs where available.
+```bash
+rm -f .chub-viewer-cache/cards.jsonl .chub-viewer-cache/cards.jsonl.tmp
+node viewer-server.cjs
+```
+
+## Generate Local Thumbnails
+
+After downloading full PNGs, generate lightweight local thumbnails:
+
+```bash
+node generate-thumbnails.cjs
+```
+
+Input:
+
+```text
+avatars/{creator}/{character}/chara_card_v2.png
+```
+
+Output:
+
+```text
+thumbs/{creator}/{character}/avatar.webp
+```
+
+Defaults:
+
+```text
+quality=72
+size=240x240 max
+concurrency=8
+```
+
+Tune if needed:
+
+```bash
+QUALITY=70 SIZE=220 CONCURRENCY=12 node generate-thumbnails.cjs
+```
+
+Progress is saved to:
+
+```text
+.thumb-progress
+```
+
+You can stop and resume. Existing thumbnails are skipped. Missing PNGs are counted as `missing`.
+
+100 random CharHub `avatar.webp` samples averaged about `9.8 KB`, projecting roughly `4.7 GB` for ~505k remote-style thumbnails. Locally generated thumbnails from the current PNG archive are larger: the current `thumbs/` folder is `8.9 GB` with the default `QUALITY=72 SIZE=240` settings.
 
 ## Search
 
@@ -147,6 +230,54 @@ name, creator, tags
 
 Descriptions and full card text are not searched by the main gallery search, because doing that across 500k large JSON files would be too heavy.
 
+Negative tag exclusions are supported:
+
+```text
+milf outdoor -male
+```
+
+This means: match `milf` and `outdoor`, but exclude cards with exact tag `male`. Exact tag exclusion avoids accidentally excluding `female`.
+
+Quoted multi-word tag exclusions are also supported:
+
+```text
+milf -"public use"
+```
+
+Creator exclusions are supported with exact, case-insensitive matching:
+
+```text
+milf outdoor -@Anonymous
+```
+
+or:
+
+```text
+milf outdoor -creator:Anonymous
+```
+
+This excludes cards whose creator is exactly `Anonymous`.
+
+Positive multi-word searches still work as normal AND word search:
+
+```text
+milf outdoor public use
+```
+
+This matches cards where all four words appear across name, creator, or tags.
+
+## Creator Pages
+
+Creator usernames in the gallery and card dialog are clickable.
+
+Clicking a creator opens:
+
+```text
+/?creator=CreatorName
+```
+
+That page shows only cards by that exact creator. Search, sorting, and public/unlisted filters still work inside the creator page.
+
 ## Opening A Card
 
 Click a card image or the `Open` button.
@@ -154,6 +285,7 @@ Click a card image or the `Open` button.
 The card dialog shows available fields as tabs:
 
 ```text
+Overview
 Description
 First Message
 Personality
@@ -165,7 +297,7 @@ Alternate Greetings
 Raw JSON
 ```
 
-Only fields with content are shown.
+`Overview` uses the extra Chub metadata description/tagline when available. The normal `Description` tab is still the JSON card description. Only fields with content are shown.
 
 ## Downloading Cards
 
@@ -186,11 +318,19 @@ PNG download behavior:
 | Local PNG exists? | Download behavior |
 |---|---|
 | Yes | Read local PNG, inject JSON, send download |
-| No | Fetch full PNG from charhub, inject JSON, send download |
+| No | Fetch full PNG from charhub endpoint, inject JSON, send download |
 
 Compressed local PNGs still work. The JSON is injected when you click download, not when the image is stored.
 
+So PNG card downloads still work without a local PNG archive as long as Chub/CharHub's full PNG endpoint remains available:
+
+```text
+https://avatars.charhub.io/avatars/{creator}/{character}/chara_card_v2.png
+```
+
 ## Download All PNGs Locally
+
+This step is optional for card data browsing, because gallery thumbnails and PNG downloads can still fall back to CharHub while its endpoints are available. It is needed if you want full local image preservation and local thumbnail generation. Once PNGs and thumbnails are local, normal gallery browsing no longer depends on Chub/CharHub's image endpoints.
 
 To mirror every PNG into `./avatars/`:
 
@@ -207,7 +347,7 @@ avatars/{creator}/{character}/chara_card_v2.png
 Example:
 
 ```text
-avatars/Anonymous/sarah-your-oblivious-free-use-mom-fc88d458a7fa/chara_card_v2.png
+avatars/Anonymous/cardname-asadasdad44sdad/chara_card_v2.png
 ```
 
 Progress is saved to:
@@ -217,6 +357,8 @@ Progress is saved to:
 ```
 
 You can stop with `Ctrl-C` and run it again later. Already downloaded files are skipped.
+
+After this has downloaded some or all PNGs, run `generate-thumbnails.cjs` so the gallery uses small local WebP thumbnails instead of full PNGs.
 
 ### Downloader Output
 
@@ -297,7 +439,9 @@ download one PNG -> write file -> compress same file -> continue
 
 So you do not need temporary storage for both the full uncompressed archive and the compressed archive.
 
-Small 100-card tests showed:
+Small 100-card tests showed aggressive potential savings, but they were not representative of the full local archive. The current measured `avatars/` folder is `162 GB`.
+
+Sample-test projections were:
 
 | pngquant setting | Projected size from 200 GB |
 |---|---:|
@@ -305,7 +449,7 @@ Small 100-card tests showed:
 | `70-70` | around 64 GB |
 | `70-80` | around 71 GB |
 
-`70-80` is the current sweet spot.
+The actual full archive depends on what was already downloaded before compression was enabled, what files `pngquant` refused to compress within the quality range, and how representative the sample was. `70-80` is still the current quality setting.
 
 ## Extra Chub Metadata
 
@@ -313,6 +457,7 @@ The JSON card files do not include all server-side Chub metadata. Chub also expo
 
 ```text
 tagline
+description
 starCount
 n_favorites
 nChats
@@ -411,3 +556,15 @@ Unlisted only
 ```
 
 Cards without fetched metadata default to public/listed for filtering purposes.
+
+## Card Layout And Mobile UI
+
+The gallery uses a compact Chub-like card layout:
+
+```text
+title bar: card name + token count + stars
+image area: full image visible, not cropped
+info area: tagline/overview, creator, tags, actions
+```
+
+On phones, the grid stays dense with two columns and a compact header so multiple cards are visible at once. Images use `object-fit: contain`, so they are scaled down but still shown in full.
