@@ -266,15 +266,18 @@ function stripSearchQuotes(value) {
 function parseSearchQuery(query) {
   const positives = [];
   const negativeTags = [];
+  const negativeCreators = [];
   const tokens = String(query || '').match(/-?"[^"]+"|-?'[^']+'|\S+/g) || [];
   for (const raw of tokens) {
     const negative = raw.startsWith('-') && raw.length > 1;
     const term = normalizeSearchTerm(stripSearchQuotes(negative ? raw.slice(1) : raw));
     if (!term) continue;
-    if (negative) negativeTags.push(term);
+    if (negative && term.startsWith('@')) negativeCreators.push(term.slice(1));
+    else if (negative && term.startsWith('creator:')) negativeCreators.push(term.slice('creator:'.length));
+    else if (negative) negativeTags.push(term);
     else positives.push(term);
   }
-  return { positives, negativeTags };
+  return { positives, negativeTags, negativeCreators: negativeCreators.filter(Boolean) };
 }
 
 function queryCards(params) {
@@ -284,7 +287,7 @@ function queryCards(params) {
   const sort   = params.get('sort')   || 'default';
   const filter = params.get('filter') || 'all';
   const creator = (params.get('creator') || '').trim().toLowerCase();
-  const { positives, negativeTags } = parseSearchQuery(q);
+  const { positives, negativeTags, negativeCreators } = parseSearchQuery(q);
 
   let filtered = cards;
 
@@ -294,8 +297,11 @@ function queryCards(params) {
   }
 
   // text search
-  if (positives.length || negativeTags.length) {
+  if (positives.length || negativeTags.length || negativeCreators.length) {
     filtered = filtered.filter((card) => {
+      const cardCreator = normalizeSearchTerm(card.creator || '');
+      if (negativeCreators.some((term) => cardCreator === term)) return false;
+
       const tags = (card.tags || []).map(normalizeSearchTerm);
       if (negativeTags.some((term) => tags.includes(term))) return false;
 
