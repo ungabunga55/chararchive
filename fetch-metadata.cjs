@@ -68,7 +68,11 @@ async function readDoneSet() {
   const done = new Set();
   if (!fs.existsSync(META_PATH)) return done;
   await readLines(META_PATH, line => {
-    try { const m = JSON.parse(line); if (m.fullPath) done.add(m.fullPath); } catch {}
+    try {
+      const m = JSON.parse(line);
+      // Older meta rows did not store node.description. Refetch those once.
+      if (m.fullPath && Object.hasOwn(m, 'description')) done.add(m.fullPath);
+    } catch {}
   });
   return done;
 }
@@ -79,6 +83,7 @@ function extractMeta(fullPath, node) {
     : 0;
   return {
     fullPath,
+    description:    node.description      || '',
     tagline:        node.tagline          || '',
     starCount:      node.starCount        || 0,
     nFavorites:     node.n_favorites      || 0,
@@ -103,8 +108,8 @@ async function fetchOne(fullPath) {
     'Origin':      'https://chub.ai',
     'Referer':     'https://chub.ai/',
     'User-Agent':  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
-    'ch-api-key':  'your account key - get it via network api (open your chub profile, f12, network, refresh, inspect for this parameter',
-    'samwise':     'your account key - get it via network api (open your chub profile, f12, network, inspect for this parameter',
+    'ch-api-key':  'your key',
+    'samwise':     'your key',
     'Accept':      '*/*',
   };
 
