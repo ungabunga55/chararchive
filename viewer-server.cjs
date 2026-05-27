@@ -16,6 +16,7 @@ const INDEX_TMP_PATH = path.join(CACHE_DIR, 'cards.jsonl.tmp');
 const META_PATH = path.join(CACHE_DIR, 'meta.jsonl');
 const HTML_PATH = path.join(ROOT, 'viewer.html');
 const AVATARS_DIR = path.join(ROOT, 'avatars');
+const THUMBS_DIR = path.join(ROOT, 'thumbs');
 
 const AVATAR_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
@@ -56,6 +57,7 @@ async function loadMeta() {
 function enrichWithMeta(card) {
   const m = metaMap.get(card.fullPath);
   if (!m) return;
+  card.metaDescription = m.description || '';
   card.tagline       = m.tagline       || '';
   card.starCount     = m.starCount     || 0;
   card.nFavorites    = m.nFavorites    || 0;
@@ -115,9 +117,8 @@ function getChub(data) {
 function getImageUrl(data) {
   const fullPath = getChub(data).full_path;
   if (typeof fullPath === 'string' && fullPath) {
-    // Always route through /img/ — serves local PNG if downloaded,
-    // otherwise redirects to the lightweight charhub webp
-    return `/img/${encodeURI(fullPath)}/chara_card_v2.png`;
+    // Gallery thumbnails are local-only: thumb webp first, full PNG fallback.
+    return `/thumb/${encodeURI(fullPath)}/avatar.webp`;
   }
   return '';
 }
@@ -250,22 +251,56 @@ async function buildIndex() {
   status.finishedAt = Date.now();
 }
 
+function normalizeSearchTerm(value) {
+  return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function stripSearchQuotes(value) {
+  const s = String(value || '').trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    return s.slice(1, -1);
+  }
+  return s;
+}
+
+function parseSearchQuery(query) {
+  const positives = [];
+  const negativeTags = [];
+  const tokens = String(query || '').match(/-?"[^"]+"|-?'[^']+'|\S+/g) || [];
+  for (const raw of tokens) {
+    const negative = raw.startsWith('-') && raw.length > 1;
+    const term = normalizeSearchTerm(stripSearchQuotes(negative ? raw.slice(1) : raw));
+    if (!term) continue;
+    if (negative) negativeTags.push(term);
+    else positives.push(term);
+  }
+  return { positives, negativeTags };
+}
+
 function queryCards(params) {
-  const q      = (params.get('q')      || '').trim().toLowerCase();
+  const q      = (params.get('q')      || '').trim();
   const offset = Math.max(0, Number(params.get('offset') || 0));
   const limit  = Math.min(80, Math.max(1, Number(params.get('limit') || 40)));
   const sort   = params.get('sort')   || 'default';
   const filter = params.get('filter') || 'all';
-  const terms  = q.split(/\s+/).filter(Boolean);
+  const creator = (params.get('creator') || '').trim().toLowerCase();
+  const { positives, negativeTags } = parseSearchQuery(q);
 
   let filtered = cards;
 
+  // exact creator page/filter
+  if (creator) {
+    filtered = filtered.filter((card) => String(card.creator || '').toLowerCase() === creator);
+  }
+
   // text search
-  if (terms.length) {
-    filtered = cards.filter((card) => {
-      const textValue = [card.name, card.creator, ...(card.tags || [])]
-        .join(' ').toLowerCase();
-      return terms.every((term) => textValue.includes(term));
+  if (positives.length || negativeTags.length) {
+    filtered = filtered.filter((card) => {
+      const tags = (card.tags || []).map(normalizeSearchTerm);
+      if (negativeTags.some((term) => tags.includes(term))) return false;
+
+      const textValue = normalizeSearchTerm([card.name, card.creator, ...(card.tags || [])].join(' '));
+      return positives.every((term) => textValue.includes(term));
     });
   }
 
@@ -465,6 +500,45 @@ async function handleImg(reqUrl, res, method) {
   res.writeHead(302, { 'location': webpUrl, 'cache-control': 'public, max-age=3600' });
   res.end();
 }
+
+async function serveStaticFile(res, method, filePath, contentType) {
+  const stat = await fsp.stat(filePath);
+  res.writeHead(200, {
+    'content-type': contentType,
+    'content-length': stat.size,
+    'cache-control': 'public, max-age=86400',
+  });
+  if (method === 'HEAD') return res.end();
+  fs.createReadStream(filePath).pipe(res);
+}
+
+async function handleThumb(reqUrl, res, method) {
+  // /thumb/{creator}/{character}/avatar.webp
+  const rel = decodeURIComponent(reqUrl.pathname.slice(7));
+  if (!rel || rel.includes('\0') || rel.includes('..')) return text(res, 400, 'Bad path');
+
+  const thumbPath = path.join(THUMBS_DIR, rel);
+  if (!thumbPath.startsWith(THUMBS_DIR + path.sep)) return text(res, 400, 'Bad path');
+
+  try {
+    return await serveStaticFile(res, method, thumbPath, 'image/webp');
+  } catch { /* no local webp thumbnail */ }
+
+  // Fallback to local full PNG.
+  const basePath = rel.replace(/\/[^/]+$/, '');
+  const pngPath = path.join(AVATARS_DIR, basePath, 'chara_card_v2.png');
+  if (!pngPath.startsWith(AVATARS_DIR + path.sep)) return text(res, 400, 'Bad path');
+
+  try {
+    return await serveStaticFile(res, method, pngPath, 'image/png');
+  } catch {
+    // Last fallback: remote lightweight CharHub thumbnail.
+    const webpUrl = `https://avatars.charhub.io/avatars/${encodeURI(basePath)}/avatar.webp`;
+    res.writeHead(302, { 'location': webpUrl, 'cache-control': 'public, max-age=3600' });
+    return res.end();
+  }
+}
+
 async function handler(req, res) {
   const reqUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   try {
@@ -479,6 +553,7 @@ async function handler(req, res) {
     if (req.method === 'GET' && reqUrl.pathname === '/api/card') return await handleCardJson(reqUrl, res);
     if ((req.method === 'GET' || req.method === 'HEAD') && reqUrl.pathname === '/download/json') return await handleJsonDownload(reqUrl, res, req.method);
     if ((req.method === 'GET' || req.method === 'HEAD') && reqUrl.pathname === '/download/png') return await handlePngDownload(reqUrl, res, req.method);
+    if ((req.method === 'GET' || req.method === 'HEAD') && reqUrl.pathname.startsWith('/thumb/')) return await handleThumb(reqUrl, res, req.method);
     if ((req.method === 'GET' || req.method === 'HEAD') && reqUrl.pathname.startsWith('/img/')) return await handleImg(reqUrl, res, req.method);
     return text(res, 404, 'Not found');
   } catch (error) {
